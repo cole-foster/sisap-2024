@@ -13,7 +13,8 @@ from pathlib import Path
 from urllib.request import urlretrieve
 import time
 
-data_directory = "data"
+# data_directory = "data"
+data_directory = "/users/cfoste18/scratch/datasets/LAION"
 
 def download(src, dst):
     if not os.path.exists(dst):
@@ -24,9 +25,12 @@ def download(src, dst):
 def prepare(kind, size):
     dataset_base_url = "https://sisap-23-challenge.s3.amazonaws.com/SISAP23-Challenge"
     task = {
-        "query": "http://ingeotec.mx/~sadit/sisap2024-data/public-queries-2024-laion2B-en-clip768v2-n=10k.h5",
-        "dataset": f"{dataset_base_url}/laion2B-en-{kind}-n={size}.h5",
+        # "query": "http://ingeotec.mx/~sadit/sisap2024-data/public-queries-2024-laion2B-en-clip768v2-n=10k.h5",
+        "query": f"{dataset_base_url}/public-queries-10k-clip768v2.h5",
+        "dataset": f"{dataset_base_url}/laion2B-en-{kind}-n={size}.h5"
     }
+
+    # print(f"okay did I prepared?")
 
     for version, url in task.items():
         download(url, os.path.join(data_directory, kind, size, f"{version}.h5"))
@@ -48,16 +52,19 @@ def store_results(dst, algo, kind, D, I, buildtime, querytime, params, size):
 def run(size):
     kind = "clip768v2"
     key = "emb"
-    print(f"Running A-HSP on {kind}-{size}")
-    index_identifier = f"HSP"
+
+    max_neighbors = 32
+    s_index = 100
+    b = 40
+    s_search = 10
+    index_identifier = f"A-HSP-s-{s_index}-b-{b}"
+    print(f"Running {index_identifier} on {kind}-{size}")
     
     #> Download dataset if necessary
     prepare(kind, size)
     D=768
 
     #> Index parameters
-    max_neighbors = 32
-    scaling = 10
     beam_size_vec = [30, 35, 40, 45, 50, 55, 60, 70, 85, 100, 120, 150, 200, 300, 400, 500, 650, 800, 1000, 1200]
 
     #> Initialize the HNSW index
@@ -69,7 +76,7 @@ def run(size):
         dataset = f[key]
         N,DD = dataset.shape
         print(f'Datset has N={N} rows and D={DD} columns')
-        index.init_index(max_elements=N, max_neighbors=max_neighbors, random_seed=10)
+        index.init_index(dataset_size=N, max_neighbors=max_neighbors, random_seed=0)
         print(" * Initiated index")
         
         # determine number of rows
@@ -84,11 +91,11 @@ def run(size):
             data_chunk = dataset[start_index:end_index]
 
             # add it to hnsw index
-            index.add_items(data_chunk, num_threads=1)
+            index.add_items(data_chunk)
     print(f" * done adding items {time.time() - start_time:.4} (s)")
 
     # construct the bottom layer graph
-    index.build(scaling)
+    index.build(s_index, b, s_search)
     build_time = time.time() - start_time
     print(f"Done Constructing Index in {build_time:.4f} (s)")
 
@@ -104,7 +111,7 @@ def run(size):
         search_time = time.time() - start
         print(f"Done searching in {search_time:.4}s.")
 
-        # save the results
+        # # save the results
         labels = labels + 1 # FAISS is 0-indexed, groundtruth is 1-indexed
         identifier = f"index=({index_identifier}),query=(b={beam_size})"
         store_results(os.path.join("result/", kind, size, f"{identifier}.h5"), index_identifier, kind, distances, labels, build_time, search_time, identifier, size)

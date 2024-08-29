@@ -9,7 +9,7 @@
 #include <iostream>
 #include <thread>
 
-#include "graph-hierarchy.hpp"
+#include "hnswlib.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;  // needed to bring in _a literal
@@ -75,6 +75,20 @@ inline void ParallelFor(size_t start, size_t end, size_t numThreads, Function fn
     }
 }
 
+inline void assert_true(bool expr, const std::string& msg) {
+    if (expr == false) throw std::runtime_error("Unpickle Error: " + msg);
+    return;
+}
+
+class CustomFilterFunctor : public hnswlib::BaseFilterFunctor {
+    std::function<bool(hnswlib::labeltype)> filter;
+
+   public:
+    explicit CustomFilterFunctor(const std::function<bool(hnswlib::labeltype)>& f) { filter = f; }
+
+    bool operator()(hnswlib::labeltype id) { return filter(id); }
+};
+
 inline void get_input_array_shapes(const py::buffer_info& buffer, size_t* rows, size_t* features) {
     if (buffer.ndim != 2 && buffer.ndim != 1) {
         char msg[256];
@@ -119,100 +133,115 @@ inline std::vector<size_t> get_input_ids_and_check_shapes(const py::object& ids_
     return ids;
 }
 
+
+
+
+template <typename dist_t, typename data_t = float>
 class Index {
    public:
-    // multithreading
-    int num_threads_default;
+    static const int ser_version = 1;  // serialization version
 
-    // space
-    distances::SpaceInterface<float>* space;
     std::string space_name;
-    int dimension;
-    bool normalize;
-
-    // index
-    GraphHierarchy* alg_;
-    uint cur_l;
-
-    // search
+    int dim;
+    size_t seed;
     size_t default_ef;
 
-    Index(const std::string& space_name, const int dimension) : space_name(space_name), dimension(dimension) {
+    bool index_inited;
+    bool normalize;
+    int num_threads_default;
+    hnswlib::labeltype cur_l;  // element count
+    hnswlib::HierarchicalNSW<dist_t>* appr_alg;
+    hnswlib::SpaceInterface<float>* l2space;
+
+    Index(const std::string& space_name, const int dim) : space_name(space_name), dim(dim) {
         normalize = false;
         if (space_name == "l2") {
-            space = new distances::L2Space(dimension);
+            l2space = new hnswlib::L2Space(dim);
         } else if (space_name == "ip") {
-            space = new distances::InnerProductSpace(dimension);
-        } 
-        // else if (space_name == "cosine") {
-        //     space = new distances::InnerProductSpace(dimension);
-        //     normalize = true;
-        // } 
-        else {
-            throw std::runtime_error("Space name must be one of l2 or ip");
+            l2space = new hnswlib::InnerProductSpace(dim);
+        } else if (space_name == "cosine") {
+            l2space = new hnswlib::InnerProductSpace(dim);
+            normalize = true;
+        } else {
+            throw std::runtime_error("Space name must be one of l2, ip, or cosine.");
         }
-        alg_ = NULL;
+        appr_alg = NULL;
+        index_inited = false;
         num_threads_default = std::thread::hardware_concurrency();
     }
 
     ~Index() {
-        delete space;
-        if (alg_) delete alg_;
+        delete l2space;
+        if (appr_alg) delete appr_alg;
     }
 
-    void init_new_index(size_t dataset_size, size_t max_neighbors, size_t random_seed) {
-        if (alg_) {
+    void init_new_index(size_t maxElements, size_t max_neighbors, size_t random_seed) {
+        if (appr_alg) {
             throw std::runtime_error("The index is already initiated.");
         }
-        alg_ = new GraphHierarchy(dimension, dataset_size, space); // just for distances
-        alg_->maxNeighbors_ = max_neighbors;
-        alg_->random_seed_ = random_seed;
         cur_l = 0;
+        appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, maxElements, max_neighbors, random_seed);
+        index_inited = true;
+        seed = random_seed;
     }
 
     void set_beam_size(size_t beam_size) {
-      if (alg_)
-          alg_->beamSize_ = beam_size;
+      if (appr_alg)
+          appr_alg->setBeamSize(beam_size);
+    }
+
+    void saveIndex(const std::string &path_to_index) {
+        appr_alg->saveIndex(path_to_index);
+    }
+
+    void loadIndex(const std::string &path_to_index) {
+      if (appr_alg) {
+          std::cerr << "Warning: Calling load_index for an already inited index. Old index is being deallocated." <<
+          std::endl; delete appr_alg;
+      }
+      appr_alg = new hnswlib::HierarchicalNSW<dist_t>(l2space, path_to_index); 
+      cur_l = appr_alg->cur_element_count; 
+      index_inited = true;
     }
 
     void addItems(py::object input, py::object ids_ = py::none(), int num_threads = -1) {
-        py::array_t<float, py::array::c_style | py::array::forcecast> items(input);
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast> items(input);
         auto buffer = items.request();
         if (num_threads <= 0) num_threads = num_threads_default;
 
         // check the dimensions of the input
         size_t rows, features;
         get_input_array_shapes(buffer, &rows, &features);
-        if (features != dimension) throw std::runtime_error("Wrong dimensionality of the vectors");
+        if (features != dim) throw std::runtime_error("Wrong dimensionality of the vectors");
         std::vector<size_t> ids = get_input_ids_and_check_shapes(ids_, rows);
 
-        // add the elements to the index
+        // add the elements to the index!
         {
             py::gil_scoped_release l;
             int start = 0;
             ParallelFor(start, rows, num_threads, [&](size_t row, size_t threadId) {
                 size_t id = ids.size() ? ids.at(row) : (cur_l + row);
-                alg_->addPoint((float*) items.data(row), (uint) id);
+                appr_alg->addPoint((void*)items.data(row), (size_t)id);
                 });
             cur_l += rows;
         }
     }
 
-    void build(int indexScaling, int indexNeighboringPartitions, int searchScaling) { 
+    void build(int scaling) { 
 
         // build the approximate hsp
-        alg_->buildGraph(indexScaling, indexNeighboringPartitions); 
+        appr_alg->build(100, 10); 
 
         // initialize a heirarchical partitioning for fast entrypoint
-        alg_->constructPartitioning(searchScaling);
+        appr_alg->createHierarchicalPartitioning(scaling);
     }
 
     // the search function
     py::object knnQuery_return_numpy(py::object input, size_t k = 1, int num_threads = -1) {
-        py::array_t <float, py::array::c_style | py::array::forcecast > items(input);
+        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
         auto buffer = items.request();
-        uint* data_numpy_l;
-        float* data_numpy_d;
+        hnswlib::labeltype* data_numpy_l;
+        dist_t* data_numpy_d;
         size_t rows, features;
 
         if (num_threads <= 0) num_threads = num_threads_default;
@@ -221,12 +250,12 @@ class Index {
             get_input_array_shapes(buffer, &rows, &features);
 
             // preparing output
-            data_numpy_l = new uint[rows * k];
-            data_numpy_d = new float[rows * k];
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new dist_t[rows * k];
 
             // perform the search (in parallel)
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                std::priority_queue<std::pair<float,uint>> result = alg_->search((float*) items.data(row), k);
+                std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn((void*)items.data(row), k);
                 if (result.size() != k)
                     throw std::runtime_error(
                         "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
@@ -246,14 +275,15 @@ class Index {
             });
 
         return py::make_tuple(
-            py::array_t<uint>(
+            py::array_t<hnswlib::labeltype>(
                 { rows, k },  // shape
-                { k * sizeof(uint), sizeof(uint) },  // C-style contiguous strides for each index
+                { k * sizeof(hnswlib::labeltype),
+                  sizeof(hnswlib::labeltype) },  // C-style contiguous strides for each index
                 data_numpy_l,  // the data pointer
                 free_when_done_l),
-            py::array_t<float>(
+            py::array_t<dist_t>(
                 { rows, k },  // shape
-                { k * sizeof(float), sizeof(float) },  // C-style contiguous strides for each index
+                { k * sizeof(dist_t), sizeof(dist_t) },  // C-style contiguous strides for each index
                 data_numpy_d,  // the data pointer
                 free_when_done_d));
     }
@@ -263,17 +293,28 @@ class Index {
 PYBIND11_PLUGIN(GraphHierarchy) {
     py::module m("GraphHierarchy");
 
-    py::class_<Index>(m, "Index")
+    py::class_<Index<float>>(m, "Index")
+        // .def(py::init(&Index<float>::createFromParams), py::arg("params"))
+        /* WARNING: Index::createFromIndex is not thread-safe with Index::addItems */
+        // .def(py::init(&Index<float>::createFromIndex), py::arg("index"))
         .def(py::init<const std::string&, const int>(), py::arg("space"), py::arg("dim"))
-        .def("init_index", &Index::init_new_index, py::arg("dataset_size"), py::arg("max_neighbors") = 32, py::arg("random_seed") = 100)
-        .def("add_items", &Index::addItems, py::arg("data"), py::arg("ids") = py::none(),
+        .def("init_index", &Index<float>::init_new_index, py::arg("max_elements"), py::arg("max_neighbors") = 32, py::arg("random_seed") = 100)
+        .def("add_items", &Index<float>::addItems, py::arg("data"), py::arg("ids") = py::none(),
              py::arg("num_threads") = -1)
-        .def("build", &Index::build, py::arg("s_index") = 100, py::arg("b") = 10, py::arg("s_search") = 10)
-        .def("set_beam_size", &Index::set_beam_size, py::arg("beam_size") = 10)
+        .def("build", &Index<float>::build, py::arg("scaling") = 10)
+        .def("set_beam_size", &Index<float>::set_beam_size, py::arg("beam_size") = 10)
         .def("knn_query",
-            &Index::knnQuery_return_numpy,
+            &Index<float>::knnQuery_return_numpy,
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1);
+    // .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
+    // .def("get_ids_list", &Index<float>::getIdsList)
+    // .def("get_max_elements", &Index<float>::getMaxElements)
+    // .def("get_current_count", &Index<float>::getCurrentCount)
+    // .def_readonly("space", &Index<float>::space_name)
+    // .def_readonly("dim", &Index<float>::dim)
+    // .def_readwrite("num_threads", &Index<float>::num_threads_default)
+
     return m.ptr();
 }

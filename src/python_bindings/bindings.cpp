@@ -128,7 +128,7 @@ class Index {
     distances::SpaceInterface<float>* space;
     std::string space_name;
     int dimension;
-    bool normalize;
+    bool normalize = false;
 
     // index
     GraphHierarchy* alg_;
@@ -164,15 +164,9 @@ class Index {
         if (alg_) {
             throw std::runtime_error("The index is already initiated.");
         }
-        alg_ = new GraphHierarchy(dimension, dataset_size, space); // just for distances
-        alg_->maxNeighbors_ = max_neighbors;
+        alg_ = new GraphHierarchy(dataset_size, space, max_neighbors);
         alg_->random_seed_ = random_seed;
         cur_l = 0;
-    }
-
-    void set_beam_size(size_t beam_size) {
-      if (alg_)
-          alg_->beamSize_ = beam_size;
     }
 
     void addItems(py::object input, py::object ids_ = py::none(), int num_threads = -1) {
@@ -198,17 +192,44 @@ class Index {
         }
     }
 
-    void build(int indexScaling, int indexNeighboringPartitions, int searchScaling) { 
+    void load(std::string path) {
+        if (alg_)
+            alg_->loadGraph(path, dimension);
+    }
 
-        // build the approximate hsp
-        alg_->buildGraph(indexScaling, indexNeighboringPartitions); 
+    void save(std::string path) {
+        if (alg_)
+            alg_->saveGraph(path, dimension);
+    }
 
-        // initialize a heirarchical partitioning for fast entrypoint
-        alg_->constructPartitioning(searchScaling);
+    void set_construction_beam_size(size_t beam_size) {
+      if (alg_)
+          alg_->beamSizeConstruction_ = beam_size;
+    }
+
+
+    // build the approximate graph
+    void build(int s, int p) { 
+        alg_->buildGraph(s, p);
+    }
+
+    void construct_partitioning(int s) { 
+        alg_->constructPartitioning(s);
+    }
+
+
+    void set_beam_size(size_t beam_size) {
+      if (alg_)
+          alg_->search_beam_size_ = beam_size;
+    }
+
+    void set_search_neighbors(size_t max_neighbors) {
+      if (alg_)
+          alg_->search_max_neighbors_ = max_neighbors;
     }
 
     // the search function
-    py::object knnQuery_return_numpy(py::object input, size_t k = 1, int num_threads = -1) {
+    py::object search(py::object input, size_t k = 1, int num_threads = -1) {
         py::array_t <float, py::array::c_style | py::array::forcecast > items(input);
         auto buffer = items.request();
         uint* data_numpy_l;
@@ -227,6 +248,60 @@ class Index {
             // perform the search (in parallel)
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                 std::priority_queue<std::pair<float,uint>> result = alg_->search((float*) items.data(row), k);
+                while (result.size() < k) {
+                    result.emplace(10000.0, 1);
+                }
+                if (result.size() != k)
+                    throw std::runtime_error(
+                        "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                for (int i = k - 1; i >= 0; i--) {
+                    auto& result_tuple = result.top();
+                    data_numpy_d[row * k + i] = result_tuple.first;
+                    data_numpy_l[row * k + i] = result_tuple.second;
+                    result.pop();
+                }
+            });
+        }
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) {
+            delete[] f;
+            });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) {
+            delete[] f;
+            });
+
+        return py::make_tuple(
+            py::array_t<uint>(
+                { rows, k },  // shape
+                { k * sizeof(uint), sizeof(uint) },  // C-style contiguous strides for each index
+                data_numpy_l,  // the data pointer
+                free_when_done_l),
+            py::array_t<float>(
+                { rows, k },  // shape
+                { k * sizeof(float), sizeof(float) },  // C-style contiguous strides for each index
+                data_numpy_d,  // the data pointer
+                free_when_done_d));
+    }
+
+    // the search function
+    py::object search_brute_force(py::object input, size_t k = 1, int num_threads = -1) {
+        py::array_t <float, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        uint* data_numpy_l;
+        float* data_numpy_d;
+        size_t rows, features;
+
+        if (num_threads <= 0) num_threads = num_threads_default;
+        {
+            py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+
+            // preparing output
+            data_numpy_l = new uint[rows * k];
+            data_numpy_d = new float[rows * k];
+
+            // perform the search (in parallel)
+            ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                std::priority_queue<std::pair<float,uint>> result = alg_->search_bruteForce((float*) items.data(row), k);
                 if (result.size() != k)
                     throw std::runtime_error(
                         "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
@@ -266,12 +341,21 @@ PYBIND11_PLUGIN(GraphHierarchy) {
     py::class_<Index>(m, "Index")
         .def(py::init<const std::string&, const int>(), py::arg("space"), py::arg("dim"))
         .def("init_index", &Index::init_new_index, py::arg("dataset_size"), py::arg("max_neighbors") = 32, py::arg("random_seed") = 100)
-        .def("add_items", &Index::addItems, py::arg("data"), py::arg("ids") = py::none(),
-             py::arg("num_threads") = -1)
-        .def("build", &Index::build, py::arg("s_index") = 100, py::arg("b") = 10, py::arg("s_search") = 10)
+        .def("add_items", &Index::addItems, py::arg("data"), py::arg("ids") = py::none(), py::arg("num_threads") = -1)
+        .def("save", &Index::save, py::arg("path"))
+        .def("load", &Index::load, py::arg("path"))
+        .def("set_beam_size_construction", &Index::set_construction_beam_size, py::arg("beam_size") = 10)
+        .def("build", &Index::build, py::arg("s") = 10, py::arg("p") = 100)
+        .def("construct_partitioning", &Index::construct_partitioning, py::arg("s") = 10)
         .def("set_beam_size", &Index::set_beam_size, py::arg("beam_size") = 10)
-        .def("knn_query",
-            &Index::knnQuery_return_numpy,
+        .def("set_search_neighbors", &Index::set_search_neighbors, py::arg("m") = 0)
+        .def("search",
+            &Index::search,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("num_threads") = -1)
+        .def("search_brute_force",
+            &Index::search_brute_force,
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1);

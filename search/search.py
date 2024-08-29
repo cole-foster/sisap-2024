@@ -49,23 +49,17 @@ def store_results(dst, algo, kind, D, I, buildtime, querytime, params, size):
     f.close()
 
 
-def run(size):
+def run(size, max_neighbors, s, p, search_neighbors):
     kind = "clip768v2"
     key = "emb"
-
-    max_neighbors = 32
-    s_index = 100
-    b = 40
-    s_search = 10
-    index_identifier = f"A-HSP-s-{s_index}-b-{b}"
+    index_identifier = f"AHSP-M-{max_neighbors}-s-{s}-p-{p}"
     print(f"Running {index_identifier} on {kind}-{size}")
+    if (search_neighbors <= 0):
+        search_neighbors = max_neighbors
     
     #> Download dataset if necessary
     prepare(kind, size)
     D=768
-
-    #> Index parameters
-    beam_size_vec = [30, 35, 40, 45, 50, 55, 60, 70, 85, 100, 120, 150, 200, 300, 400, 500, 650, 800, 1000, 1200]
 
     #> Initialize the HNSW index
     index = GraphHierarchy.Index(space='ip', dim=D) # possible options are l2, cosine or ip
@@ -87,27 +81,30 @@ def run(size):
         for start_index in range(0, total_rows, chunk_size):
             end_index = min(start_index + chunk_size, total_rows)
 
-            # load this chunk into memory
+            # load this chunk into memory, add to index
             data_chunk = dataset[start_index:end_index]
-
-            # add it to hnsw index
             index.add_items(data_chunk)
+
     print(f" * done adding items {time.time() - start_time:.4} (s)")
 
     # construct the bottom layer graph
-    index.build(s_index, b, s_search)
+    index.build(s, p)
+    index.construct_partitioning(search_neighbors) # num neighbors per node... consistent
     build_time = time.time() - start_time
     print(f"Done Constructing Index in {build_time:.4f} (s)")
 
     # get the queries
     queries = np.array(h5py.File(os.path.join(data_directory, kind, size, "query.h5"), "r")[key],dtype=np.float32)
 
+    index.set_search_neighbors(search_neighbors)
+
     #> Searching on the index
+    beam_size_vec = [30, 35, 40, 45, 50, 55, 60, 70, 85, 100, 120, 150, 200, 300, 400, 500, 650, 800, 1000]
     for beam_size in beam_size_vec:
         print(f"Searching with beam_size={beam_size}")
         start = time.time()
         index.set_beam_size(beam_size)  # ef should always be > k
-        labels, distances = index.knn_query(queries, k=30)
+        labels, distances = index.search(queries, k=30)
         search_time = time.time() - start
         print(f"Done searching in {search_time:.4}s.")
 
@@ -126,10 +123,34 @@ if __name__ == "__main__":
         type=str,
         default="300K"
     )
+    parser.add_argument(
+        "-M",
+        type=int,
+        default=16
+    )
+    parser.add_argument(
+        "-s",
+        type=int,
+        default=10
+    )
+    parser.add_argument(
+        "-p",
+        type=int,
+        default=100
+    )
+    parser.add_argument(
+        "-m",
+        type=int,
+        default=0
+    )
     args = parser.parse_args()
     assert args.size in ["300K", "10M", "100M"]
 
     print("Running Script With:")
     print(f"  * N={args.size}")
-    run(args.size)
+    print(f"  * M={args.M}")
+    print(f"  * s={args.s}")
+    print(f"  * p={args.p}")
+    print(f"  * m={args.m}")
+    run(args.size, args.M, args.s, args.p, args.m)
     print(f"Done! Have a good day!")

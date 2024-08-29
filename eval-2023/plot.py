@@ -100,4 +100,4 @@ if __name__ == "__main__":
         lines[label]["ctrls"].append(run_identifier)
     
     draw([get_pareto_frontier(line) for line in lines.values()], 
-            "Recall @ 30", "QPS (1/s)", "Result", f"result_{args.size}.png", True, 10, 8)
+            "Recall @ 30", "QPS (1/s)", "Result", f"result_{args.size}.png", False, 10, 8)

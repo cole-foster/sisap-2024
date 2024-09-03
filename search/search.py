@@ -1,6 +1,6 @@
 '''
     Cole Foster
-    August 4th, 2024
+    September 3rd, 2024
 
     SISAP 2024 Indexing Challenge
 '''
@@ -13,8 +13,7 @@ from pathlib import Path
 from urllib.request import urlretrieve
 import time
 
-# data_directory = "data"
-data_directory = "/users/cfoste18/scratch/datasets/LAION"
+data_directory = "data"
 
 def download(src, dst):
     if not os.path.exists(dst):
@@ -24,13 +23,12 @@ def download(src, dst):
 
 def prepare(kind, size):
     dataset_base_url = "https://sisap-23-challenge.s3.amazonaws.com/SISAP23-Challenge"
+    query_base_url = "http://ingeotec.mx/~sadit/sisap2024-data"
     task = {
-        # "query": "http://ingeotec.mx/~sadit/sisap2024-data/public-queries-2024-laion2B-en-clip768v2-n=10k.h5",
-        "query": f"{dataset_base_url}/public-queries-10k-clip768v2.h5",
-        "dataset": f"{dataset_base_url}/laion2B-en-{kind}-n={size}.h5"
+        "dataset": f"{dataset_base_url}/laion2B-en-{kind}-n={size}.h5",
+        "query": f"{query_base_url}/public-queries-2024-laion2B-en-clip768v2-n=10k.h5",
+        "private-query": f"{query_base_url}/private-queries-2024-laion2B-en-clip768v2-n=10k-epsilon=0.2.h5"
     }
-
-    # print(f"okay did I prepared?")
 
     for version, url in task.items():
         download(url, os.path.join(data_directory, kind, size, f"{version}.h5"))
@@ -48,24 +46,21 @@ def store_results(dst, algo, kind, D, I, buildtime, querytime, params, size):
     f.create_dataset('dists', D.shape, dtype=D.dtype)[:] = D
     f.close()
 
-
-def run(size, max_neighbors, s, p, search_neighbors):
-    kind = "clip768v2"
-    key = "emb"
-    index_identifier = f"AHSP-M-{max_neighbors}-s-{s}-p-{p}"
+kind = "clip768v2"
+key = "emb"
+def run(size, k, max_neighbors, scaling_factor, num_domains):
+    index_identifier = f"AHSP-M-{max_neighbors}-s-{scaling_factor}-p-{num_domains}"
     print(f"Running {index_identifier} on {kind}-{size}")
-    if (search_neighbors <= 0):
-        search_neighbors = max_neighbors
     
     #> Download dataset if necessary
     prepare(kind, size)
     D=768
 
     #> Initialize the HNSW index
+    start_time = time.time()
     index = GraphHierarchy.Index(space='ip', dim=D) # possible options are l2, cosine or ip
 
     #> Load the dataset
-    start_time = time.time()
     with h5py.File(os.path.join(data_directory, kind, size, "dataset.h5"), 'r') as f:
         dataset = f[key]
         N,DD = dataset.shape
@@ -84,27 +79,32 @@ def run(size, max_neighbors, s, p, search_neighbors):
             # load this chunk into memory, add to index
             data_chunk = dataset[start_index:end_index]
             index.add_items(data_chunk)
-
     print(f" * done adding items {time.time() - start_time:.4} (s)")
 
-    # construct the bottom layer graph
-    index.build(s, p)
-    index.construct_partitioning(search_neighbors) # num neighbors per node... consistent
+    # construct the approximate hsp graph on the bottom layer
+    index.build(scaling_factor, num_domains)
+
+    # option to save / load the bottom layer graph. It just saves the graph, so `construct_partitioning()` will still
+    # have to be called
+    # index.load("graph.bin")
+    # index.save("graph.bin")
+
+    # rebuild the hierarchical structure for fast entry-point into bottom layer graph
+    index.construct_partitioning(max_neighbors) # num neighbors per node... consistent
     build_time = time.time() - start_time
     print(f"Done Constructing Index in {build_time:.4f} (s)")
 
-    # get the queries
+    # load the queries
     queries = np.array(h5py.File(os.path.join(data_directory, kind, size, "query.h5"), "r")[key],dtype=np.float32)
-
-    index.set_search_neighbors(search_neighbors)
+    # queries = np.array(h5py.File(os.path.join(data_directory, kind, size, "private-query.h5"), "r")[key],dtype=np.float32)
 
     #> Searching on the index
-    beam_size_vec = [30, 35, 40, 45, 50, 55, 60, 70, 85, 100, 120, 150, 200, 300, 400, 500, 650, 800, 1000]
+    beam_size_vec = [30, 30, 35, 40, 45, 50, 55, 60, 70, 85, 100, 120, 150, 200, 300, 400, 500, 650, 800, 1000]
     for beam_size in beam_size_vec:
         print(f"Searching with beam_size={beam_size}")
         start = time.time()
         index.set_beam_size(beam_size)  # ef should always be > k
-        labels, distances = index.search(queries, k=30)
+        labels, distances = index.search(queries, k=k)
         search_time = time.time() - start
         print(f"Done searching in {search_time:.4}s.")
 
@@ -114,14 +114,17 @@ def run(size, max_neighbors, s, p, search_neighbors):
         store_results(os.path.join("result/", kind, size, f"{identifier}.h5"), index_identifier, kind, distances, labels, build_time, search_time, identifier, size)
     
 
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--size",
         type=str,
         default="300K"
+    )
+    parser.add_argument(
+        "-k",
+        type=int,
+        default=30
     )
     parser.add_argument(
         "-M",
@@ -136,21 +139,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "-p",
         type=int,
-        default=100
-    )
-    parser.add_argument(
-        "-m",
-        type=int,
-        default=0
+        default=50
     )
     args = parser.parse_args()
     assert args.size in ["300K", "10M", "100M"]
 
     print("Running Script With:")
     print(f"  * N={args.size}")
+    print(f"  * k={args.k}")
     print(f"  * M={args.M}")
     print(f"  * s={args.s}")
     print(f"  * p={args.p}")
-    print(f"  * m={args.m}")
-    run(args.size, args.M, args.s, args.p, args.m)
+    run(args.size, args.k, args.M, args.s, args.p)
     print(f"Done! Have a good day!")

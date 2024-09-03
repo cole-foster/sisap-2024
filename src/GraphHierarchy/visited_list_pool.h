@@ -1,5 +1,16 @@
 #pragma once
 
+/*
+|=======================================================================================================================
+||
+||                      DISTANCE COMPUTATIONS
+||
+||  * DIRECTLY OBTAINED FROM HNSWLIB (https://github.com/nmslib/hnswlib.git)
+||  * used as a visited list during graph search
+||  * handles multithreading, not initializing more arrays than necessary
+||
+|=======================================================================================================================
+*/
 #include <mutex>
 #include <string.h>
 #include <deque>

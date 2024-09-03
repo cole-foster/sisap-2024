@@ -1,4 +1,16 @@
 #pragma once
+
+/**
+ * @file graph-hierarchy.hpp
+ * @author Cole Foster (cole_foster@brown.edu)
+ * @date 2024-09-03
+ * 
+ * Submission to the SISAP 2024 Indexing Challenge
+ * This implementation uses many of the performance optimizations from HNSWLIB (https://github.com/nmslib/hnswlib.git)
+ *      - vectorization of distance computations in distances.h
+ *      - graph and dataset stored together for better cache locality
+ *      - cache prefetching in search function
+ */
 #include <omp.h>
 
 #include <algorithm>
@@ -266,6 +278,7 @@ class GraphHierarchy {
     }
 
     // perform the hsp test to get the hsp neighbors of the node
+    // use maxK to constrain the hsp test to the maxK closest elements in the set
     std::vector<uint> HSPTest(uint const query, std::vector<uint> const& set, int maxK = 0) const {
         std::vector<uint> neighbors{};
         char* queryPtr = getDataByIndex(query);
@@ -519,7 +532,7 @@ class GraphHierarchy {
 |=======================================================================================================================
 ||
 ||
-||                          APPROXIMATE GRAPH CONSTRUCTION
+||                          TOP-DOWN GRAPH CONSTRUCTION
 ||
 ||
 |=======================================================================================================================
@@ -983,7 +996,6 @@ class GraphHierarchy {
     // - perform search using graph
     std::priority_queue<std::pair<float, uint>> search(const void* query_ptr_v, int k = 1) {
         char* query_ptr = (char*) query_ptr_v;
-        // if (num_levels_ == 0) std::runtime_error("No hierarchy initialized\n");
         
         // find entry-point in graph by top-down traversal of hierarchical partitioning
         // tStart = std::chrono::high_resolution_clock::now();

@@ -1,8 +1,5 @@
 data/
-result/
-results/
 dev/
 slurm*
-run.sh
-res.csv
-result_*
+run*
+res*

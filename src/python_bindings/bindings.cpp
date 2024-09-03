@@ -153,6 +153,7 @@ class Index {
         }
         alg_ = NULL;
         num_threads_default = std::thread::hardware_concurrency();
+        printf(" * default num threads: %d\n", num_threads_default);
     }
 
     ~Index() {
